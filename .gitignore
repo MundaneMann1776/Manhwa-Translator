@@ -1,0 +1,7 @@
+.env
+.venv/
+final_scanlate/
+temp_scanlate/
+__pycache__/
+.DS_Store
+*.pyc

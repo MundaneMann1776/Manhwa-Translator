@@ -1,0 +1,7 @@
+google-generativeai
+Pillow
+beautifulsoup4
+requests
+python-dotenv
+easyocr
+numpy

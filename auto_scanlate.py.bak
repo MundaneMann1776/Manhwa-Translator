@@ -1,0 +1,376 @@
+import os
+import sys
+
+# --- Auto-Bootstrap Virtual Environment ---
+# If we are running with system python but a local venv exists, switch to it.
+QUERY_VENV_PATH = os.path.join(os.path.dirname(__file__), ".venv")
+if os.path.exists(QUERY_VENV_PATH) and sys.prefix != QUERY_VENV_PATH:
+    venv_python = os.path.join(QUERY_VENV_PATH, "bin", "python")
+    if os.path.exists(venv_python):
+        # Re-execute the script with the venv python
+        print(f"[*] Switching to virtual environment: {venv_python}...")
+        os.execv(venv_python, [venv_python] + sys.argv)
+# ------------------------------------------
+
+import json
+import shutil
+import subprocess
+import argparse
+from typing import List, Dict, Any
+import requests
+from bs4 import BeautifulSoup
+import google.generativeai as genai
+from PIL import Image, ImageDraw, ImageFont
+from dotenv import load_dotenv
+
+# --- Configuration ---
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MODEL_NAME = "gemini-2.0-flash"
+TEMP_DIR = "temp_scanlate"
+OUTPUT_DIR = "final_scanlate"
+
+def setup_directories():
+    """Ensures temp and output directories exist."""
+    if not os.path.exists(TEMP_DIR):
+        os.makedirs(TEMP_DIR)
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+        
+# ... (scrape functions unchanged) ...
+
+def get_ocr_and_translation(model, image_path: str) -> List[Dict[str, Any]]:
+    # ... (docstring) ...
+    print(f"[*] Analyzing {os.path.basename(image_path)}...")
+    
+    try:
+        img = Image.open(image_path)
+    except Exception as e:
+        print(f"Failed to open image: {e}")
+        return []
+
+    prompt = """
+    Analyze this comic page. Detect all speech bubbles or text areas containing Korean text.
+    For each text area, return a JSON object with:
+    1. "box_2d": [ymin, xmin, ymax, xmax] (normalized coordinates 0-1000).
+    2. "translation": The English translation of the text.
+    
+    Return ONLY a raw JSON list of these objects. Example:
+    [
+      {"box_2d": [100, 200, 150, 400], "translation": "Hello!"},
+      ...
+    ]
+    Do not use markdown code blocks. Just valid JSON.
+    """
+
+    max_retries = 5
+    base_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content([prompt, img])
+            text_response = response.text.strip()
+            if text_response.startswith("```json"): text_response = text_response[7:]
+            if text_response.endswith("```"): text_response = text_response[:-3]
+                
+            data = json.loads(text_response)
+            
+            # --- VERBOSE LOGGING START ---
+            if data:
+                print(f"    -> Detected {len(data)} text bubbles.")
+                # Print first translation to prove it's working
+                first_tr = data[0].get('translation', '...')
+                if len(first_tr) > 50: first_tr = first_tr[:50] + "..."
+                print(f"    -> Sample: \"{first_tr}\"")
+            else:
+                print("    -> No text detected.")
+            # -----------------------------
+            
+            return data
+
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "Resource exhausted" in error_str:
+                delay = base_delay * (2 ** attempt)
+                print(f"    [!] Rate limited. Retrying in {delay}s...")
+                time.sleep(delay)
+                continue
+            else:
+                print(f"Error processing AI response: {e}")
+                return []
+    
+    print("    [!] Failed after max retries.")
+    return []
+    """Fallback scraper using requests + bs4 + heuristic filtering."""
+    print("[*] Attempting generic scrape (fallback)...")
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+    
+    # 1. Clean TEMP
+    if os.path.exists(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+    os.makedirs(TEMP_DIR)
+    
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.content, "html.parser")
+        
+        # Find likely content images
+        img_tags = soup.find_all("img")
+        candidates = []
+        for img in img_tags:
+            src = img.get("src") or img.get("data-src") or img.get("data-original")
+            if src and src.strip().startswith("http"):
+                candidates.append(src.strip())
+        
+        # Dedupe
+        candidates = list(dict.fromkeys(candidates))
+        print(f"    Found {len(candidates)} potential images.")
+
+        saved_paths = []
+        for i, src in enumerate(candidates):
+            try:
+                # Basic filename
+                ext = "jpg"
+                if ".png" in src: ext = "png"
+                elif ".webp" in src: ext = "webp"
+                
+                filename = f"image_{i:03d}.{ext}"
+                local_path = os.path.join(TEMP_DIR, filename)
+                
+                # Download
+                r = requests.get(src, headers=headers, stream=True, timeout=5)
+                if r.status_code == 200:
+                    with open(local_path, 'wb') as f:
+                        for chunk in r.iter_content(1024):
+                            f.write(chunk)
+                    
+                    # Filter by size (ignore icons/ads)
+                    try:
+                        with Image.open(local_path) as im:
+                            w, h = im.size
+                            # Heuristic: Comic pages are usually large vertical or horizontal
+                            if w > 300 and h > 300:
+                                saved_paths.append(local_path)
+                            else:
+                                os.remove(local_path)
+                    except:
+                        # Corrupt image?
+                        if os.path.exists(local_path): os.remove(local_path)
+
+            except Exception as e:
+                pass
+                
+        print(f"    Saved {len(saved_paths)} images after size filtering.")
+        return saved_paths
+
+    except Exception as e:
+        print(f"Generic scrape failed: {e}")
+        return []
+
+def run_gallery_dl(url: str) -> List[str]:
+    """
+    Runs gallery-dl. Returns list of paths, or empty list on failure.
+    """
+    print(f"[*] Scraping images from {url} using gallery-dl...")
+    
+    # Check if gallery-dl is installed (PATH or venv)
+    gdl_path = shutil.which("gallery-dl")
+    if gdl_path is None:
+        # Fallback: Check if it's in the same directory as the current python interpreter
+        possible_path = os.path.join(os.path.dirname(sys.executable), "gallery-dl")
+        if os.path.exists(possible_path):
+            gdl_path = possible_path
+
+    if gdl_path is None:
+        print("Warning: 'gallery-dl' not found. Will try generic scraper.")
+        return []
+
+    # Clean temp dir first
+    if os.path.exists(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+    os.makedirs(TEMP_DIR)
+
+    try:
+        cmd = [gdl_path, "-d", TEMP_DIR, url]
+        # Allow it to fail without crashing script
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError:
+        print(f"Warning: gallery-dl failed for {url}")
+        return [] # Return empty to trigger fallback
+
+    # Find all images recursively in TEMP_DIR
+    image_paths = []
+    for root, dirs, files in os.walk(TEMP_DIR):
+        for file in files:
+            if file.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                image_paths.append(os.path.join(root, file))
+    
+    image_paths.sort() 
+    print(f"[*] Found {len(image_paths)} images with gallery-dl.")
+    return image_paths
+
+import time
+
+def get_ocr_and_translation(model, image_path: str) -> List[Dict[str, Any]]:
+    """
+    Sends image to Gemini and requests JSON output with bounding boxes and translations.
+    """
+    print(f"[*] Analyzing {os.path.basename(image_path)}...")
+    
+    try:
+        img = Image.open(image_path)
+    except Exception as e:
+        print(f"Failed to open image: {e}")
+        return []
+
+    prompt = """
+    Analyze this comic page. Detect all speech bubbles or text areas containing Korean text.
+    For each text area, return a JSON object with:
+    1. "box_2d": [ymin, xmin, ymax, xmax] (normalized coordinates 0-1000).
+    2. "translation": The English translation of the text.
+    
+    Return ONLY a raw JSON list of these objects. Example:
+    [
+      {"box_2d": [100, 200, 150, 400], "translation": "Hello!"},
+      ...
+    ]
+    Do not use markdown code blocks. Just valid JSON.
+    """
+
+    max_retries = 5
+    base_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content([prompt, img])
+            text_response = response.text.strip()
+            
+            # Strip markdown if present
+            if text_response.startswith("```json"):
+                text_response = text_response[7:]
+            if text_response.endswith("```"):
+                text_response = text_response[:-3]
+                
+            data = json.loads(text_response)
+            return data
+
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "Resource exhausted" in error_str:
+                delay = base_delay * (2 ** attempt)
+                print(f"    [!] Rate limited. Retrying in {delay}s...")
+                time.sleep(delay)
+                continue
+            else:
+                print(f"Error processing AI response: {e}")
+                return []
+    
+    print("    [!] Failed after max retries.")
+    return []
+
+def process_image(image_path: str, overlay_data: List[Dict[str, Any]]):
+    """
+    Draws over the original image with translated text.
+    """
+    try:
+        img = Image.open(image_path).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        width, height = img.size
+
+        # Try to load a font
+        try:
+            # MacOS common font
+            font = ImageFont.truetype("Arial.ttf", 20)
+        except:
+             try:
+                 font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 20)
+             except:
+                font = ImageFont.load_default()
+
+        for item in overlay_data:
+            box = item.get("box_2d")
+            text = item.get("translation")
+            
+            if not box or not text:
+                continue
+
+            # Convert normalized (0-1000) to pixel coordinates
+            ymin, xmin, ymax, xmax = box
+            abs_ymin = (ymin / 1000) * height
+            abs_xmin = (xmin / 1000) * width
+            abs_ymax = (ymax / 1000) * height
+            abs_xmax = (xmax / 1000) * width
+
+            # 1. Erase (Draw White Rectangle)
+            # Add a small padding to cover text fully
+            padding = 5
+            rect = [abs_xmin - padding, abs_ymin - padding, abs_xmax + padding, abs_ymax + padding]
+            draw.rectangle(rect, fill="white", outline="white")
+
+            # 2. Write Text
+            # Simple word wrap logic could go here, but for now we just write simple text
+            # Calculate center
+            center_x = (abs_xmin + abs_xmax) / 2
+            center_y = (abs_ymin + abs_ymax) / 2
+            
+            # Estimate text size (very rough) to center it
+            # For robust wrapping, we'd need more complex logic
+            draw.text((abs_xmin, abs_ymin), text, fill="black", font=font)
+
+        # Save to output
+        out_filename = os.path.basename(image_path)
+        out_path = os.path.join(OUTPUT_DIR, out_filename)
+        img.save(out_path)
+        print(f"    -> Saved scanlation to: {out_path}")
+
+    except Exception as e:
+        print(f"Error drawing on image: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Auto Scanlate Manhwa")
+    parser.add_argument("url", nargs="?", help="URL of the manhwa chapter")
+    args = parser.parse_args()
+
+    url = args.url
+    if not url:
+        url = input("Enter Manhwa URL: ").strip()
+    
+    if not url:
+        print("No URL provided.")
+        return
+
+    # Setup
+    setup_directories()
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel(MODEL_NAME)
+
+    # 1. Scrape
+    images = run_gallery_dl(url)
+    if not images:
+        print("gallery-dl returned no images. Trying generic fallback...")
+        images = scrape_generic(url)
+        
+    if not images:
+        print("No images found/downloaded.")
+        return
+
+    # 2. Process Loop
+    print(f"[*] Starting AI Processing on {len(images)} images...")
+    for img_path in images:
+        # OCR + Translate
+        data = get_ocr_and_translation(model, img_path)
+        
+        # Draw
+        if data:
+            process_image(img_path, data)
+        else:
+            # If AI fails, just copy original
+            out_name = os.path.basename(img_path)
+            shutil.copy(img_path, os.path.join(OUTPUT_DIR, out_name))
+            print(f"    -> Copied original (no text detected)")
+
+    print(f"\n[DONE] Check the '{OUTPUT_DIR}' folder.")
+
+if __name__ == "__main__":
+    main()
